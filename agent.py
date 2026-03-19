@@ -197,7 +197,10 @@ def web_search(query: str) -> str:
     if tavily_client is None:
         return "Web search error: missing TAVILY_API_KEY environment variable."
 
-    generated_query = _optimize_search_query(clean_query)
+    try:
+        generated_query = _optimize_search_query(clean_query)
+    except Exception:
+        generated_query = clean_query
 
     try:
         tavily_response = tavily_client.search(
@@ -217,7 +220,15 @@ def web_search(query: str) -> str:
         response=tavily_response,
     )
 
-    answer = _answer_from_structured_web_results(clean_query, structured_web_results)
+    try:
+        answer = _answer_from_structured_web_results(clean_query, structured_web_results)
+    except Exception as exc:
+        return (
+            "Web search synthesis error: "
+            f"{exc}\n"
+            f"Structured evidence:\n{json.dumps(structured_web_results, indent=2)}"
+        )
+
     if answer:
         return answer
 
