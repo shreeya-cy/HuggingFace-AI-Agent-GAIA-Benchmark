@@ -36,6 +36,7 @@ load_dotenv()
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+MAX_TOOL_ITERATIONS = 10
 SYSTEM_PROMPT_PATH = Path(__file__).with_name("system_prompt.txt")
 
 
@@ -455,6 +456,7 @@ def run_with_tools(prompt: str) -> str:
 
     llm = ChatOllama(
         model=MODEL_NAME,
+        temperature=0.0,
         base_url=OLLAMA_HOST,
     )
     llm_with_tools = llm.bind_tools(tools)
@@ -464,26 +466,42 @@ def run_with_tools(prompt: str) -> str:
         HumanMessage(content=prompt),
     ]
 
-    response = llm_with_tools.invoke(messages)
-    messages.append(response)
+    for _ in range(MAX_TOOL_ITERATIONS):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
 
-    for tool_call in response.tool_calls:
-        selected_tool = tools_by_name.get(tool_call["name"])
-        if selected_tool is None:
-            continue
+        if not response.tool_calls:
+            return _llm_to_text(response.content)
 
-        tool_result = selected_tool.invoke(tool_call["args"])
-        messages.append(
-            ToolMessage(
-                content=tool_result,
-                tool_call_id=tool_call["id"],
+        for tool_call in response.tool_calls:
+            tool_name = tool_call["name"]
+            selected_tool = tools_by_name.get(tool_name)
+
+            if selected_tool is None:
+                tool_result = f"Tool error: unknown tool '{tool_name}'"
+            else:
+                try:
+                    tool_result = selected_tool.invoke(tool_call["args"])
+                except Exception as exc:
+                    tool_result = f"Tool error: {exc}"
+
+            messages.append(
+                ToolMessage(
+                    content=tool_result,
+                    tool_call_id=tool_call["id"],
+                )
+            )
+
+    messages.append(
+        HumanMessage(
+            content=(
+                "Tool iteration limit reached. Provide your best final answer now "
+                "without any additional tool calls."
             )
         )
-
-    if response.tool_calls:
-        response = llm_with_tools.invoke(messages)
-
-    return response.content
+    )
+    final_response = llm.invoke(messages)
+    return _llm_to_text(final_response.content)
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
