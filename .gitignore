@@ -1,0 +1,16 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Local environment files
+.env
+
+# Local run artifacts
+answers.json
+questions.json
+
+node_modules/
