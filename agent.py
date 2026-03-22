@@ -17,13 +17,13 @@ from typing import Any
 import urllib.error
 import urllib.request
 from contextlib import redirect_stdout
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+
 
 from bs4 import BeautifulSoup
+
 from langchain_ollama import ChatOllama
 from dotenv import load_dotenv
-from langchain_community.tools import WikipediaQueryRun
-from langchain_community.utilities import WikipediaAPIWrapper
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from pypdf import PdfReader
@@ -38,6 +38,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 MAX_TOOL_ITERATIONS = 10
 SYSTEM_PROMPT_PATH = Path(__file__).with_name("system_prompt.txt")
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 
 
 def load_system_prompt() -> str:
@@ -55,7 +56,6 @@ SYSTEM_PROMPT = load_system_prompt()
 
 tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
 tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
-wikipedia_client = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
 ALLOWED_FUNCTIONS = {
     "abs": abs,
     "ceil": math.ceil,
@@ -131,16 +131,28 @@ def _optimize_search_query(original_query: str) -> str:
     return optimized or original_query
 
 
+def _site_key_from_url(url: str) -> str:
+    if not url:
+        return ""
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
 def _normalize_tavily_results(
     original_query: str,
     generated_query: str,
     response: dict[str, Any],
 ) -> dict[str, Any]:
     normalized_results = []
+    seen_sites: set[str] = set()
     raw_results = response.get("results", [])
 
     if isinstance(raw_results, list):
-        for index, row in enumerate(raw_results[:8], start=1):
+        for row in raw_results:
             if not isinstance(row, dict):
                 continue
 
@@ -148,16 +160,24 @@ def _normalize_tavily_results(
             url = str(row.get("url", "")).strip()
             snippet = str(row.get("content", "")).strip()
             score = row.get("score")
+            site_key = _site_key_from_url(url)
+
+            if site_key and site_key in seen_sites:
+                continue
+            if site_key:
+                seen_sites.add(site_key)
 
             normalized_results.append(
                 {
-                    "rank": index,
+                    "rank": len(normalized_results) + 1,
                     "title": title,
                     "url": url,
                     "snippet": snippet[:700],
                     "score": score,
                 }
             )
+            if len(normalized_results) >= 8:
+                break
 
     return {
         "original_query": original_query,
@@ -168,12 +188,18 @@ def _normalize_tavily_results(
     }
 
 
+
 def _answer_from_structured_web_results(question: str, evidence: dict[str, Any]) -> str:
     evidence_json = json.dumps(evidence, indent=2)
     system_prompt = (
-        "Answer the user's question using only the provided JSON web evidence. "
-        "If evidence is missing or conflicting, clearly state uncertainty and give the best-supported answer. "
-        "Be concise."
+          "Rewrite the user question into a precise web search query.\n"
+        "Rules:\n"
+        "- Preserve all key entities (names, dates, locations, numbers).\n"
+        "- Include important constraints (e.g., 'latest', '2025', 'comparison', etc.).\n"
+        "- Make the query specific and unambiguous.\n"
+        "- Avoid adding new assumptions.\n"
+        "- Use concise keyword-style phrasing (like a search engine query).\n"
+        "- Return only ONE query, no explanations, no quotes.\n"
     )
     human_prompt = (
         f"User question:\n{question}\n\n"
@@ -186,6 +212,144 @@ def _answer_from_structured_web_results(question: str, evidence: dict[str, Any])
             HumanMessage(content=human_prompt),
         ]
     )
+
+
+def _safe_json_loads(value: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _format_trace_for_cli(trace: dict[str, Any]) -> str:
+    lines: list[str] = []
+
+    tools_used = trace.get("tools_used", [])
+    lines.append("Tools used:")
+    if tools_used:
+        lines.extend(f"- {tool_name}" for tool_name in tools_used)
+    else:
+        lines.append("- none")
+
+    searches = trace.get("searches", [])
+    if searches:
+        lines.append("")
+        lines.append("Search queries:")
+        for search in searches:
+            tool_name = str(search.get("tool_name", "")).strip() or "unknown"
+            original_query = str(search.get("query", "")).strip()
+            generated_query = str(search.get("generated_search_query", "")).strip()
+            page_title = str(search.get("page_title", "")).strip()
+            error_text = str(search.get("error", "")).strip()
+
+            lines.append(f"- {tool_name}: {original_query or 'n/a'}")
+            if generated_query and generated_query != original_query:
+                lines.append(f"  generated query: {generated_query}")
+            if page_title:
+                lines.append(f"  page title: {page_title}")
+            if error_text:
+                lines.append(f"  error: {error_text}")
+
+            tavily_results = search.get("tavily_results", [])
+            if isinstance(tavily_results, list) and tavily_results:
+                lines.append("  Tavily results:")
+                for row in tavily_results:
+                    if not isinstance(row, dict):
+                        continue
+                    rank = row.get("rank", "?")
+                    title = str(row.get("title", "")).strip() or "Untitled"
+                    url = str(row.get("url", "")).strip() or "n/a"
+                    snippet = str(row.get("snippet", "")).strip()
+                    score = row.get("score")
+                    score_text = f" | score={score}" if score is not None else ""
+                    lines.append(f"  - [{rank}] {title}{score_text}")
+                    lines.append(f"    {url}")
+                    if snippet:
+                        lines.append(f"    {snippet}")
+
+    return "\n".join(lines)
+
+
+def _http_get_json(url: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        raw = response.read().decode("utf-8", errors="ignore")
+    return json.loads(raw)
+
+
+def _strip_html_text(value: str) -> str:
+    if BeautifulSoup is None:
+        text = re.sub(r"<[^>]+>", " ", value)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    soup = BeautifulSoup(value, "html.parser")
+    return soup.get_text("\n", strip=True)
+
+
+def _search_wikipedia_page(query: str) -> tuple[str | None, str | None]:
+    encoded_query = quote(query)
+    url = (
+        f"{WIKIPEDIA_API_URL}?action=query&list=search&srsearch={encoded_query}"
+        "&utf8=1&format=json&srlimit=1"
+    )
+    payload = _http_get_json(url)
+    search_results = payload.get("query", {}).get("search", [])
+    if not search_results:
+        return None, None
+
+    first_result = search_results[0]
+    page_title = str(first_result.get("title", "")).strip()
+    page_snippet = _strip_html_text(str(first_result.get("snippet", ""))).strip()
+    return page_title or None, page_snippet or None
+
+
+def _get_wikipedia_sections(page_title: str) -> list[dict[str, str]]:
+    encoded_title = quote(page_title)
+    url = (
+        f"{WIKIPEDIA_API_URL}?action=parse&page={encoded_title}"
+        "&prop=sections&format=json"
+    )
+    payload = _http_get_json(url)
+    sections = payload.get("parse", {}).get("sections", [])
+    normalized_sections: list[dict[str, str]] = []
+
+    if not isinstance(sections, list):
+        return normalized_sections
+
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        normalized_sections.append(
+            {
+                "index": str(section.get("index", "")).strip(),
+                "line": str(section.get("line", "")).strip(),
+                "number": str(section.get("number", "")).strip(),
+                "level": str(section.get("level", "")).strip(),
+            }
+        )
+
+    return normalized_sections
+
+
+def _get_wikipedia_section_text(page_title: str, section_index: str) -> str:
+    encoded_title = quote(page_title)
+    encoded_index = quote(section_index)
+    url = (
+        f"{WIKIPEDIA_API_URL}?action=parse&page={encoded_title}&prop=text"
+        f"&section={encoded_index}&format=json"
+    )
+    payload = _http_get_json(url)
+    raw_html = payload.get("parse", {}).get("text", {}).get("*", "")
+    if not isinstance(raw_html, str) or not raw_html.strip():
+        return ""
+
+    text = _strip_html_text(raw_html)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 @tool
@@ -230,16 +394,78 @@ def web_search(query: str) -> str:
             f"Structured evidence:\n{json.dumps(structured_web_results, indent=2)}"
         )
 
-    if answer:
-        return answer
-
-    return json.dumps(structured_web_results, indent=2)
+    payload = {
+        "query": clean_query,
+        "generated_search_query": generated_query,
+        "tavily_results": structured_web_results.get("results", []),
+        "answer": answer or "",
+    }
+    return json.dumps(payload, indent=2)
 
 
 @tool
 def wikipedia_search(query: str) -> str:
-    """Search Wikipedia for background information about a topic."""
-    return wikipedia_client.invoke(query)
+    """Resolve a Wikipedia page for the query and return the available sections. Call wikipedia_section_content next for the most relevant section."""
+
+    try:
+        generated_query = _optimize_search_query(query.strip())
+    except Exception:
+        generated_query = query.strip()
+
+    try:
+        page_title, page_snippet = _search_wikipedia_page(generated_query)
+    except Exception as exc:
+        return f"Wikipedia search error: {exc}"
+
+    if not page_title:
+        return f"Wikipedia search error: no page found for query '{generated_query}'."
+
+    try:
+        sections = _get_wikipedia_sections(page_title)
+    except Exception as exc:
+        return f"Wikipedia search error: unable to list sections for '{page_title}': {exc}"
+
+    payload = {
+        "query": query.strip(),
+        "generated_search_query": generated_query,
+        "page_title": page_title,
+        "page_snippet": page_snippet or "",
+        "sections": sections,
+        "instruction": (
+            "Choose the most relevant section index for the user's query, then call "
+            "wikipedia_section_content with that page_title and section_index."
+        ),
+    }
+    return json.dumps(payload, indent=2)
+
+
+@tool
+def wikipedia_section_content(page_title: str, section_index: str) -> str:
+    """Fetch the text content of one Wikipedia section using the page title and section index returned by wikipedia_search."""
+    clean_title = page_title.strip()
+    clean_index = section_index.strip()
+    if not clean_title:
+        return "Wikipedia section error: page_title cannot be empty."
+    if not clean_index:
+        return "Wikipedia section error: section_index cannot be empty."
+
+    try:
+        section_text = _get_wikipedia_section_text(clean_title, clean_index)
+    except Exception as exc:
+        return f"Wikipedia section error: {exc}"
+
+    if not section_text:
+        return (
+            f"Wikipedia section error: no content found for page '{clean_title}' "
+            f"section '{clean_index}'."
+        )
+
+    payload = {
+        "page_title": clean_title,
+        "section_index": clean_index,
+        "content": section_text[:4000],
+    }
+    return json.dumps(payload, indent=2)
 
 
 def safe_calculate(expression: str) -> float | int:
@@ -309,12 +535,19 @@ def fetch_webpage(url: str) -> str:
     except urllib.error.URLError as exc:
         return f"Webpage fetch error: {exc}"
 
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
+    if BeautifulSoup is None:
+        html = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", " ", html, flags=re.IGNORECASE)
+        html = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", " ", html, flags=re.IGNORECASE)
+        html = re.sub(r"<noscript\b[^<]*(?:(?!</noscript>)<[^<]*)*</noscript>", " ", html, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
+    else:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
 
-    text = soup.get_text(separator=" ", strip=True)
-    text = re.sub(r"\s+", " ", text).strip()
+        text = soup.get_text(separator=" ", strip=True)
+        text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return "Webpage fetch error: no readable text found on the page."
 
@@ -442,10 +675,11 @@ def python_executor(code: str) -> str:
     return "\n\n".join(parts)[:4000]
 
 
-def run_with_tools(prompt: str) -> str:
+def run_with_tools(prompt: str) -> dict[str, Any]:
     tools = [
         web_search,
         wikipedia_search,
+        wikipedia_section_content,
         calculator,
         python_executor,
         fetch_webpage,
@@ -465,25 +699,86 @@ def run_with_tools(prompt: str) -> str:
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ]
+    trace: dict[str, Any] = {
+        "tools_used": [],
+        "tool_calls": [],
+        "searches": [],
+    }
+    seen_tools: set[str] = set()
 
     for _ in range(MAX_TOOL_ITERATIONS):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
 
         if not response.tool_calls:
-            return _llm_to_text(response.content)
+            return {
+                "answer": _llm_to_text(response.content),
+                "trace": trace,
+            }
 
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
             selected_tool = tools_by_name.get(tool_name)
+            tool_args = tool_call.get("args", {})
+
+            if tool_name not in seen_tools:
+                trace["tools_used"].append(tool_name)
+                seen_tools.add(tool_name)
 
             if selected_tool is None:
                 tool_result = f"Tool error: unknown tool '{tool_name}'"
             else:
                 try:
-                    tool_result = selected_tool.invoke(tool_call["args"])
+                    tool_result = selected_tool.invoke(tool_args)
                 except Exception as exc:
                     tool_result = f"Tool error: {exc}"
+
+            tool_event = {
+                "tool_name": tool_name,
+                "args": tool_args,
+                "result": tool_result,
+            }
+            trace["tool_calls"].append(tool_event)
+
+            parsed_result = _safe_json_loads(tool_result)
+            if tool_name == "web_search" and parsed_result is not None:
+                trace["searches"].append(
+                    {
+                        "tool_name": tool_name,
+                        "query": parsed_result.get("query", ""),
+                        "generated_search_query": parsed_result.get("generated_search_query", ""),
+                        "tavily_results": parsed_result.get("tavily_results", []),
+                    }
+                )
+            elif tool_name == "web_search":
+                trace["searches"].append(
+                    {
+                        "tool_name": tool_name,
+                        "query": tool_args.get("query", ""),
+                        "generated_search_query": "",
+                        "tavily_results": [],
+                        "error": tool_result,
+                    }
+                )
+            elif tool_name == "wikipedia_search" and parsed_result is not None:
+                trace["searches"].append(
+                    {
+                        "tool_name": tool_name,
+                        "query": parsed_result.get("query", ""),
+                        "generated_search_query": parsed_result.get("generated_search_query", ""),
+                        "page_title": parsed_result.get("page_title", ""),
+                        "page_snippet": parsed_result.get("page_snippet", ""),
+                    }
+                )
+            elif tool_name == "wikipedia_search":
+                trace["searches"].append(
+                    {
+                        "tool_name": tool_name,
+                        "query": tool_args.get("query", ""),
+                        "generated_search_query": "",
+                        "error": tool_result,
+                    }
+                )
 
             messages.append(
                 ToolMessage(
@@ -501,7 +796,10 @@ def run_with_tools(prompt: str) -> str:
         )
     )
     final_response = llm.invoke(messages)
-    return _llm_to_text(final_response.content)
+    return {
+        "answer": _llm_to_text(final_response.content),
+        "trace": trace,
+    }
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -572,10 +870,13 @@ def run_gaia_batch(limit: int = 20) -> None:
         )
 
         try:
-            model_answer = run_with_tools(gaia_prompt).strip()
+            run_result = run_with_tools(gaia_prompt)
+            model_answer = str(run_result.get("answer", "")).strip()
+            execution_trace = run_result.get("trace", {})
         except Exception as exc:
             status = "error"
             error = str(exc)
+            execution_trace = {}
 
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
         result_item = {
@@ -586,6 +887,7 @@ def run_gaia_batch(limit: int = 20) -> None:
             "task_file_error": task_file_error,
             "question": question,
             "model_answer": model_answer,
+            "execution_trace": execution_trace,
             "status": status,
             "error": error,
             "elapsed_ms": elapsed_ms,
@@ -641,9 +943,12 @@ def main():
         run_gaia_batch(limit=limit)
         return
 
-    response = run_with_tools(prompt)
+    run_result = run_with_tools(prompt)
+    response = str(run_result.get("answer", ""))
+    trace = run_result.get("trace", {})
     print(f"Model: {MODEL_NAME}")
     print(f"Prompt: {prompt}")
+    print(_format_trace_for_cli(trace))
     print("Response:")
     print(response)
 

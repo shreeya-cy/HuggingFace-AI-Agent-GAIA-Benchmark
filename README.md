@@ -7,6 +7,8 @@
 - Each question is then answered one-by-one by the tool-enabled agent, and detailed records are written to `answers.json`.
 - Running `agent.py` with a prompt argument keeps normal chat behavior.
 - Web search now uses Tavily with an internal 2-step LLM flow: query optimization before search, then answer synthesis from structured JSON evidence kept in memory.
+- Normal prompt runs now print the tools used, any web/Wikipedia search queries, and the normalized Tavily results shown to the agent.
+- GAIA batch output now stores an `execution_trace` per answer in `answers.json`, including tool calls and search metadata.
 
 ## Environment
 
